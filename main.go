@@ -8,15 +8,13 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 9800, "WebSocket server port")
-	file := flag.String("file", "", "Log file to watch immediately on startup")
+	port := flag.Int("port", 9800, "Porta do servidor WebSocket")
 	flag.Parse()
 
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-	log.Printf("sdk-agent v0.1.0 starting...")
+	log.SetFlags(log.Ldate | log.Ltime)
 
-	srv := server.New(*port, *file)
+	srv := server.New(*port)
 	if err := srv.Start(); err != nil {
-		log.Fatalf("Server error: %v", err)
+		log.Fatalf("Erro ao iniciar servidor: %v", err)
 	}
 }

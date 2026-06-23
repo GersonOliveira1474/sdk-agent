@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -17,24 +18,33 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-type Server struct {
-	port    int
-	tail    *watcher.Tail
-	clients map[*websocket.Conn]bool
-	mu      sync.Mutex
+type session struct {
+	conn *websocket.Conn
+	tail *watcher.Tail
+	mu   sync.Mutex
 }
 
-func New(port int, defaultFile string) *Server {
-	s := &Server{
-		port:    port,
-		clients: make(map[*websocket.Conn]bool),
+func (s *session) send(v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conn.WriteMessage(websocket.TextMessage, data)
+}
 
-	s.tail = watcher.New(defaultFile, func(line string) {
-		s.broadcast(protocol.OutgoingLine{Type: "line", Data: line})
-	})
+type Server struct {
+	port     int
+	sessions map[*websocket.Conn]*session
+	mu       sync.Mutex
+}
 
-	return s
+func New(port int) *Server {
+	return &Server{
+		port:     port,
+		sessions: make(map[*websocket.Conn]*session),
+	}
 }
 
 func (s *Server) Start() error {
@@ -47,12 +57,7 @@ func (s *Server) Start() error {
 	go s.heartbeatLoop()
 
 	addr := fmt.Sprintf(":%d", s.port)
-	log.Printf("sdk-agent listening on ws://localhost%s/ws", addr)
-
-	if s.tail.FilePath() != "" {
-		log.Printf("Auto-watching: %s", s.tail.FilePath())
-		s.tail.Start()
-	}
+	printAccessInfo(s.port)
 
 	return http.ListenAndServe(addr, nil)
 }
@@ -64,20 +69,32 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sess := &session{conn: conn}
+
 	s.mu.Lock()
-	s.clients[conn] = true
+	s.sessions[conn] = sess
+	count := len(s.sessions)
 	s.mu.Unlock()
 
-	log.Printf("Client connected (%d total)", len(s.clients))
+	log.Printf("Cliente conectado (%d ativo(s))", count)
 
-	s.sendStatus(conn)
+	sess.send(protocol.OutgoingStatus{
+		Type:     "status",
+		Watching: false,
+		File:     "",
+		Position: 0,
+	})
 
 	defer func() {
+		if sess.tail != nil {
+			sess.tail.Stop()
+		}
 		s.mu.Lock()
-		delete(s.clients, conn)
+		delete(s.sessions, conn)
+		remaining := len(s.sessions)
 		s.mu.Unlock()
 		conn.Close()
-		log.Printf("Client disconnected (%d remaining)", len(s.clients))
+		log.Printf("Cliente desconectado (%d restante(s))", remaining)
 	}()
 
 	for {
@@ -85,91 +102,73 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			break
 		}
-		s.handleMessage(conn, msgBytes)
+		s.handleMessage(sess, msgBytes)
 	}
 }
 
-func (s *Server) handleMessage(conn *websocket.Conn, raw []byte) {
+func (s *Server) handleMessage(sess *session, raw []byte) {
 	var msg protocol.IncomingMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
-		log.Printf("Invalid message: %v", err)
+		log.Printf("Mensagem inválida: %v", err)
 		return
 	}
 
 	switch msg.Type {
 	case "start":
-		if msg.File != "" {
-			s.tail.Stop()
-			s.tail.SetFile(msg.File)
+		if sess.tail != nil {
+			sess.tail.Stop()
 		}
+
+		file := msg.File
+		if file == "" {
+			log.Printf("Start sem arquivo")
+			return
+		}
+
+		sess.tail = watcher.New(file, func(line string) {
+			sess.send(protocol.OutgoingLine{Type: "line", Data: line})
+		})
+
 		backlog := msg.Backlog
 		if backlog <= 0 {
 			backlog = 500
 		}
-		lines, err := s.tail.ReadBacklog(backlog)
+
+		lines, err := sess.tail.ReadBacklog(backlog)
 		if err != nil {
-			log.Printf("Backlog error: %v", err)
+			log.Printf("Erro ao ler backlog: %v", err)
 		} else if len(lines) > 0 {
-			s.sendTo(conn, protocol.OutgoingBacklog{
+			sess.send(protocol.OutgoingBacklog{
 				Type:  "backlog",
 				Lines: lines,
-				File:  s.tail.FilePath(),
+				File:  file,
 			})
 		}
-		s.tail.Start()
-		log.Printf("Started watching: %s", s.tail.FilePath())
-		s.broadcastStatus()
+
+		sess.tail.Start()
+		log.Printf("Monitorando: %s", file)
+
+		sess.send(protocol.OutgoingStatus{
+			Type:     "status",
+			Watching: true,
+			File:     file,
+			Position: sess.tail.Position(),
+		})
 
 	case "stop":
-		s.tail.Stop()
-		log.Printf("Stopped watching")
-		s.broadcastStatus()
+		if sess.tail != nil {
+			sess.tail.Stop()
+			log.Printf("Parou de monitorar: %s", sess.tail.FilePath())
+		}
+		sess.send(protocol.OutgoingStatus{
+			Type:     "status",
+			Watching: false,
+			File:     "",
+			Position: 0,
+		})
 
 	case "ping":
-		s.sendTo(conn, protocol.OutgoingHeartbeat{Type: "heartbeat"})
-	}
-}
-
-func (s *Server) sendStatus(conn *websocket.Conn) {
-	s.sendTo(conn, protocol.OutgoingStatus{
-		Type:     "status",
-		Watching: s.tail.IsRunning(),
-		File:     s.tail.FilePath(),
-		Position: s.tail.Position(),
-	})
-}
-
-func (s *Server) broadcastStatus() {
-	s.broadcast(protocol.OutgoingStatus{
-		Type:     "status",
-		Watching: s.tail.IsRunning(),
-		File:     s.tail.FilePath(),
-		Position: s.tail.Position(),
-	})
-}
-
-func (s *Server) sendTo(conn *websocket.Conn, v interface{}) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-	conn.WriteMessage(websocket.TextMessage, data)
-}
-
-func (s *Server) broadcast(v interface{}) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for conn := range s.clients {
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			conn.Close()
-			delete(s.clients, conn)
-		}
+		sess.send(protocol.OutgoingHeartbeat{Type: "heartbeat"})
 	}
 }
 
@@ -178,6 +177,43 @@ func (s *Server) heartbeatLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.broadcast(protocol.OutgoingHeartbeat{Type: "heartbeat"})
+		s.mu.Lock()
+		for _, sess := range s.sessions {
+			sess.send(protocol.OutgoingHeartbeat{Type: "heartbeat"})
+		}
+		s.mu.Unlock()
 	}
+}
+
+func printAccessInfo(port int) {
+	log.Println("═══════════════════════════════════════════════════")
+	log.Println("  sdk-agent v0.2.0 iniciado")
+	log.Println("═══════════════════════════════════════════════════")
+
+	ips := getLocalIPs()
+	for _, ip := range ips {
+		log.Printf("  Endereço: %s:%d", ip, port)
+	}
+	if len(ips) == 0 {
+		log.Printf("  Endereço: localhost:%d", port)
+	}
+
+	log.Println("")
+	log.Println("  Informe o endereço acima no Interpretador SDK")
+	log.Println("  para conectar no modo ao vivo.")
+	log.Println("═══════════════════════════════════════════════════")
+}
+
+func getLocalIPs() []string {
+	var ips []string
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ips
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			ips = append(ips, ipnet.IP.String())
+		}
+	}
+	return ips
 }
